@@ -32,9 +32,9 @@ void evalObj(Individual& ind) {
     double T_out = 29.5;
     double k = 0.35;
 
-    // 修改舒适度公式使最大值接近 1
-    double comfort = 1.0 / (std::abs(T_in - 25) + 1e-6); // +1e-6避免除以零
-    comfort = clamp(comfort, 0.0, 1.0); // 使用自定义clamp
+    // 保持原始舒适度公式
+    double comfort = 1.0 / (std::abs(T_in - 25) + 1e-6);
+    comfort = clamp(comfort, 0.0, 1.0);
 
     double energy = k * std::abs(T_in - T_out) * t;
 
@@ -98,29 +98,40 @@ struct ObjComparator {
 
 // 计算拥挤度
 void calculate_crowding(std::vector<Individual>& front) {
-    if (front.empty()) return; // 添加空检查
+    if (front.size() <= 2) {
+        for (size_t i = 0; i < front.size(); ++i) {
+            front[i].crowding = std::numeric_limits<double>::max();
+        }
+        return;
+    }
 
     for (size_t i = 0; i < front.size(); ++i) {
         front[i].crowding = 0.0;
     }
 
     for (size_t m = 0; m < front[0].objs.size(); ++m) {
-        // 排序
         std::sort(front.begin(), front.end(), ObjComparator(m));
-
-        if (front.size() > 1) {
-            front[0].crowding = front.back().crowding = std::numeric_limits<double>::max();
-
-            for (size_t i = 1; i < front.size() - 1; ++i) {
-                front[i].crowding += (front[i + 1].objs[m] - front[i - 1].objs[m]);
-            }
+        
+        double min_obj = front.front().objs[m];
+        double max_obj = front.back().objs[m];
+        double range = max_obj - min_obj;
+        
+        if (range < 1e-6) continue;
+        
+        front[0].crowding = front.back().crowding = std::numeric_limits<double>::max();
+        
+        for (size_t i = 1; i < front.size() - 1; ++i) {
+            front[i].crowding += (front[i+1].objs[m] - front[i-1].objs[m]) / range;
         }
     }
 }
 
 // 比较函数用于排序（按适应度值排序）
 bool less_fitness(const Individual& a, const Individual& b) {
-    return a.fitness < b.fitness;
+    if (a.fitness != b.fitness) {
+        return a.fitness < b.fitness;
+    }
+    return a.crowding > b.crowding; // 拥挤度大的优先
 }
 
 // 环境选择
@@ -130,23 +141,37 @@ void environmental_selection(std::vector<Individual>& pop, std::vector<Individua
 
     calculate_strength(combined_pop);
     calculate_fitness(combined_pop);
+    calculate_crowding(combined_pop);
 
-    // 调试信息
-    std::cout << "Combined population size: " << combined_pop.size() << std::endl;
-
-    // 选择适应度值较低的个体
+    // 按适应度和拥挤度排序
     std::sort(combined_pop.begin(), combined_pop.end(), less_fitness);
 
+    // 选择适应度最好的个体
     archive.clear();
-    for (size_t i = 0; i < archive_size && i < combined_pop.size(); ++i) {
-        archive.push_back(combined_pop[i]);
+    size_t count = 0;
+    for (size_t i = 0; i < combined_pop.size() && count < archive_size; ++i) {
+        if (combined_pop[i].fitness < 1.0) { // 只选择非支配解
+            archive.push_back(combined_pop[i]);
+            count++;
+        }
     }
 
-    // 调试信息
-    std::cout << "Archive size: " << archive.size() << std::endl;
-
-    // 计算拥挤度以维护多样性
-    calculate_crowding(archive);
+    // 如果非支配解不足，补充其他解
+    if (archive.size() < archive_size) {
+        for (size_t i = 0; i < combined_pop.size() && archive.size() < archive_size; ++i) {
+            bool exists = false;
+            for (size_t j = 0; j < archive.size(); ++j) {
+                if (combined_pop[i].vars[0] == archive[j].vars[0] && 
+                    combined_pop[i].vars[1] == archive[j].vars[1]) {
+                    exists = true;
+                    break;
+                }
+            }
+            if (!exists) {
+                archive.push_back(combined_pop[i]);
+            }
+        }
+    }
 }
 
 // 交叉操作
@@ -172,10 +197,10 @@ void crossover(const Individual& p1, const Individual& p2, Individual& c1, Indiv
 
 // 变异操作
 void mutate(Individual& ind) {
-    double rate = 0.1;
+    double rate = 0.2; // 提高变异率
     for (size_t i = 0; i < ind.vars.size(); ++i) {
         if (rand() / (double)RAND_MAX < rate) {
-            ind.vars[i] += (rand() / (double)RAND_MAX - 0.5) * 0.1;
+            ind.vars[i] += (rand() / (double)RAND_MAX - 0.5) * 1.0; // 增大变异幅度
         }
     }
 
@@ -197,6 +222,8 @@ std::vector<Individual> spea2(size_t pop_size, size_t archive_size, size_t max_g
     }
 
     for (size_t gen = 0; gen < max_gen; ++gen) {
+        std::cout << "Generation " << gen + 1 << "/" << max_gen << std::endl;
+
         // 评估种群
         for (size_t i = 0; i < pop.size(); ++i) {
             evalObj(pop[i]);
@@ -207,36 +234,59 @@ std::vector<Individual> spea2(size_t pop_size, size_t archive_size, size_t max_g
 
         // 生成新种群
         std::vector<Individual> offspring;
-        for (size_t i = 0; i < pop_size; i += 2) {
-            if (i + 1 >= archive.size()) break; // 防止越界
+        while (offspring.size() < pop_size) {
+            size_t i1 = rand() % archive.size();
+            size_t i2 = rand() % archive.size();
+            if (i1 == i2) continue;
+            
             Individual c1, c2;
-            crossover(archive[i], archive[i + 1], c1, c2);
+            crossover(archive[i1], archive[i2], c1, c2);
             mutate(c1);
             mutate(c2);
             evalObj(c1);
             evalObj(c2);
             offspring.push_back(c1);
-            offspring.push_back(c2);
+            if (offspring.size() < pop_size) {
+                offspring.push_back(c2);
+            }
         }
 
         pop = offspring;
     }
 
+    // 最终环境选择
+    environmental_selection(pop, archive, archive_size);
     return archive;
 }
 
 int main() {
     srand(time(NULL));  // 初始化随机种子
-    size_t pop_size = 100;    // 种群大小
-    size_t archive_size = 10; // 存档大小
-    size_t max_gen = 10;     // 最大迭代次数
+    
+    // 参数设置
+    size_t pop_size = 100;     // 增大种群大小
+    size_t archive_size = 100;  // 增大存档大小
+    size_t max_gen = 50;       // 增加迭代次数
 
     std::vector<Individual> result = spea2(pop_size, archive_size, max_gen);
 
-    std::cout << "Pareto 前沿：" << std::endl;
+    // 输出Pareto前沿
+    std::cout << "\nPareto 前沿（共 " << result.size() << " 个解）：" << std::endl;
     for (size_t i = 0; i < result.size(); ++i) {
-        std::cout << "T_in = " << result[i].vars[0] << "°C, t = " << result[i].vars[1] << "h, "
-                  << "舒适度 = " << -result[i].objs[0] << ", 能耗 = " << result[i].objs[1] << std::endl;
+        double comfort = -result[i].objs[0];
+        std::cout << "解 " << i+1 << ": T_in = " << result[i].vars[0] 
+                  << "°C, t = " << result[i].vars[1] << "h, "
+                  << "舒适度 = " << comfort << ", 能耗 = " << result[i].objs[1] << std::endl;
+    }
+
+    // 输出舒适度接近1的解
+    std::cout << "\n舒适度接近1的解：" << std::endl;
+    for (size_t i = 0; i < result.size(); ++i) {
+        double comfort = -result[i].objs[0];
+        if (comfort > 0.9) {
+            std::cout << "解 " << i+1 << ": T_in = " << result[i].vars[0] 
+                      << "°C, t = " << result[i].vars[1] << "h, "
+                      << "舒适度 = " << comfort << ", 能耗 = " << result[i].objs[1] << std::endl;
+        }
     }
 
     return 0;
